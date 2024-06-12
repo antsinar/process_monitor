@@ -1,0 +1,7 @@
+venv/*
+*.html
+*.png
+*.jpg
+sql/*
+*.db
+*.sqlite3
