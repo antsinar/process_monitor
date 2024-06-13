@@ -13,6 +13,22 @@ import matplotlib.pyplot as plt
 import psutil
 from tabulate import tabulate
 
+
+class Actions(StrEnum):
+    COLLECT = "collect"
+    QUERY = "query"
+    MATCH_BUILD = "match_build"
+    QUERY_BUILD = "query_build"
+
+
+class BuildBase(StrEnum):
+    ELECTRON = "electron"
+    JVM = "jvm"
+    DOTNET = "dotnet"
+    QT = "qt"
+    OTHER = "?"
+
+
 schema_query = """
     CREATE TABLE IF NOT EXISTS events(
         id INTEGER PRIMARY KEY,
@@ -57,35 +73,194 @@ process_query = """
     OFFSET ?
 """
 
-build_query = """SELECT cpu_usage, memory_usage, uss, charge_diff, ts
-                FROM events
-                JOIN builds ON events.proc_name=builds.proc_name
-                WHERE builds.build = ?
-                AND events.ts BETWEEN ? AND ?
-                ORDER BY events.ts ASC
-                LIMIT ?
-                OFFSET ?
+build_query = """
+    SELECT cpu_usage, memory_usage, uss, charge_diff, ts
+    FROM events
+    JOIN builds ON events.proc_name=builds.proc_name
+    WHERE builds.build = ?
+    AND events.ts BETWEEN ? AND ?
+    ORDER BY events.ts ASC
+    LIMIT ?
+    OFFSET ?
+"""
+
+count_query = """
+    SELECT COUNT(*)
+    FROM events
+    WHERE proc_name = ?
+    AND ts BETWEEN ? AND  ?
+"""
+
+
+async def init_db():
+    """Initialize db tables from script
+    TODO: Normalize 1st-stage::processes
+    """
+    async with aiosqlite.connect("events.db") as db:
+        try:
+            await db.executescript(schema_query)
+            await db.commit()
+            await db.close()
+        except aiosqlite.OperationalError as e:
+            print("[E] Error in appling database schema\n\t", e)
+            sys.exit(1)
+
+
+@asynccontextmanager
+async def db_session():
+    """
+    Generate db session and manage it's lifecycle
+    """
+    async with aiosqlite.connect("events.db") as db:
+        try:
+            yield db
+        except aiosqlite.OperationalError as e:
+            print("[E] Error in yielding database session:\n\t", e)
+            sys.exit(1)
+        finally:
+            await db.commit()
+            await db.close()
+
+
+async def query_build(display_in_browser: bool = False) -> None:
+    """Query events from processes following the input build"""
+    build = input(f">> Query build technology:\n Options: {'/'.join(BuildBase)}\n>>")
+
+    ts_from = input(">> Query from datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
+
+    ts_to = input(">> Query to datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
+
+    limit = input(">> Set results limit: ")
+    offset = input(">> Set results offset: ")
+
+    try:
+        datetime_to = datetime.strptime(ts_to, "%d/%m/%Y %H:%M:%S")
+        datetime_to = datetime_to - datetime_to.astimezone().tzinfo.utcoffset(
+            datetime_to
+        )
+        datetime_from = datetime.strptime(ts_from, "%d/%m/%Y %H:%M:%S")
+        datetime_from = datetime_from - datetime_from.astimezone().tzinfo.utcoffset(
+            datetime_from
+        )
+    except ValueError as e:
+        print("[E] Date format Error\n\t", e)
+        sys.exit(1)
+
+    try:
+        limit = int(limit)
+        offset = int(offset)
+    except ValueError:
+        print("[E] Could not parse limit/offset")
+        sys.exit(1)
+
+    async with db_session() as db:
+        rows = await db.execute(
+            build_query,
+            (build, datetime_from, datetime_to, limit, offset),
+        )
+        rows_result = await rows.fetchall()
+
+    if display_in_browser:
+        show_in_browser(rows_result)
+    else:
+        print(f"From: {datetime_from}, To: {datetime_to}")
+        print(
+            tabulate(
+                [row for row in rows_result],
+                ["CPU %", "Memory RSS (MB)", "Memory USS (MB)", "Charge Difference %"],
+                tablefmt="pretty",
+            )
+        )
+
+
+async def query_process(proc_name: str) -> None:
+    """Query collected porcesses from db"""
+    ts_from = input(">> Query from datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
+
+    ts_to = input(">> Query to datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
+
+    limit = input(">> Set results limit: ")
+    offset = input(">> Set results offset: ")
+
+    try:
+        datetime_to = datetime.strptime(ts_to, "%d/%m/%Y %H:%M:%S")
+        datetime_to = datetime_to - datetime_to.astimezone().tzinfo.utcoffset(
+            datetime_to
+        )
+        datetime_from = datetime.strptime(ts_from, "%d/%m/%Y %H:%M:%S")
+        datetime_from = datetime_from - datetime_from.astimezone().tzinfo.utcoffset(
+            datetime_from
+        )
+    except ValueError as e:
+        print("[E] Date format Error\n\t", e)
+        sys.exit(1)
+
+    try:
+        limit = int(limit)
+        offset = int(offset)
+    except ValueError:
+        print("[E] Could not parse limit/offset")
+        sys.exit(1)
+
+    async with db_session() as db:
+        num_rows = await db.execute(
+            count_query,
+            (proc_name, datetime_from, datetime_to),
+        )
+        print(f"[X] Total Rows: {(await num_rows.fetchone())[0]}")
+        print(f"From: {datetime_from}, To: {datetime_to}")
+
+        rows = await db.execute(
+            process_query,
+            (proc_name, datetime_from, datetime_to, limit, offset),
+        )
+        rows_result = await rows.fetchall()
+
+    print(
+        tabulate(
+            [row for row in rows_result],
+            ["CPU %", "Memory RSS (MB)", "Memory USS (MB)", "Charge Difference %"],
+            tablefmt="pretty",
+        )
+    )
+
+
+async def save_build_info(proc_name: str) -> None:
+    """Append build information to db"""
+    build = await detect_tech_stack(proc_name)
+    async with db_session() as db:
+        name_exists = await db.execute(
             """
-
-count_query = """SELECT COUNT(*)
-                FROM events
-                WHERE proc_name = ?
-                AND ts BETWEEN ? AND  ?
-              """
-
-class Actions(StrEnum):
-    COLLECT = "collect"
-    QUERY = "query"
-    MATCH_BUILD = "match_build"
-    QUERY_BUILD = "query_build"
-
-
-class BuildBase(StrEnum):
-    ELECTRON = "electron"
-    JVM = "jvm"
-    DOTNET = "dotnet"
-    QT = "qt"
-    OTHER = "?"
+                       SELECT proc_name
+                       FROM builds
+                       WHERE proc_name = ?
+                   """,
+            [proc_name],
+        )
+        if await name_exists.fetchone():
+            print(f"[X] Updating build information for process {proc_name}")
+            try:
+                await db.execute(
+                    """
+                        UPDATE builds
+                        SET build = ?
+                        WHERE proc_name = ?
+                    """,
+                    (build.value, proc_name),
+                )
+            except aiosqlite.OperationalError as e:
+                print("[E] Error updating build information", e)
+        else:
+            try:
+                await db.execute(
+                    """
+                      INSERT INTO builds
+                      VALUES (?, ?)
+                    """,
+                    (proc_name, build.value),
+                )
+            except aiosqlite.OperationalError:
+                print(f"[E] Error creating build information for {proc_name}")
 
 
 async def detect_tech_stack(
@@ -127,91 +302,6 @@ async def prompt_for_build_tech(proc_name: str) -> None:
             return BuildBase.QT
         case _:
             return BuildBase.OTHER
-
-
-async def save_build_info(proc_name: str) -> None:
-    """Append build information to db"""
-    build = await detect_tech_stack(proc_name)
-    async with db_session() as db:
-        name_exists = await db.execute(
-            """
-                       SELECT proc_name
-                       FROM builds
-                       WHERE proc_name = ?
-                   """,
-            [proc_name],
-        )
-        if await name_exists.fetchone():
-            print(f"[X] Updating build information for process {proc_name}")
-            try:
-                await db.execute(
-                    """
-                        UPDATE builds
-                        SET build = ?
-                        WHERE proc_name = ?
-                    """,
-                    (build.value, proc_name),
-                )
-            except aiosqlite.OperationalError as e:
-                print("[E] Error updating build information", e)
-        else:
-            try:
-                await db.execute(
-                    """
-                      INSERT INTO builds
-                      VALUES (?, ?)
-                    """,
-                    (proc_name, build.value),
-                )
-            except aiosqlite.OperationalError:
-                print(f"[E] Error creating build information for {proc_name}")
-
-
-async def query_build(display_in_browser: bool = False) -> None:
-    """Query events from processes following the input build"""
-    build = input(f">> Query build technology:\n Options: {'/'.join(BuildBase)}\n>>")
-
-    ts_from = input(">> Query from datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
-
-    ts_to = input(">> Query to datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
-
-    limit = input(">> Set results limit: ")
-    offset = input(">> Set results offset: ")
-
-    try:
-        datetime_to = datetime.strptime(ts_to, "%d/%m/%Y %H:%M:%S")
-        datetime_to = datetime_to - datetime_to.astimezone().tzinfo.utcoffset(datetime_to)
-        datetime_from = datetime.strptime(ts_from, "%d/%m/%Y %H:%M:%S")
-        datetime_from = datetime_from - datetime_from.astimezone().tzinfo.utcoffset(datetime_from)
-    except ValueError as e:
-        print("[E] Date format Error\n\t", e)
-        sys.exit(1)
-
-    try:
-        limit = int(limit)
-        offset = int(offset)
-    except ValueError:
-        print("[E] Could not parse limit/offset")
-        sys.exit(1)
-
-    async with db_session() as db:
-        rows = await db.execute(
-            build_query,
-            (build, datetime_from, datetime_to, limit, offset),
-        )
-        rows_result = await rows.fetchall()
-
-    if display_in_browser:
-        show_in_browser(rows_result)
-    else:
-        print(f"From: {datetime_from}, To: {datetime_to}")
-        print(
-            tabulate(
-                [row for row in rows_result],
-                ["CPU %", "Memory RSS (MB)", "Memory USS (MB)", "Charge Difference %"],
-                tablefmt="pretty",
-            )
-        )
 
 
 def get_main_process_by_name(process_name):
@@ -276,12 +366,8 @@ async def monitor_process_tree(process_tree, duration, event_q: asyncio.Queue):
                     total_uss = None
 
                 io_counters = proc.io_counters()
-                total_read_bytes += io_counters.read_bytes / (
-                    1024 * 1024
-                ) 
-                total_write_bytes += io_counters.write_bytes / (
-                    1024 * 1024
-                ) 
+                total_read_bytes += io_counters.read_bytes / (1024 * 1024)
+                total_write_bytes += io_counters.write_bytes / (1024 * 1024)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
 
@@ -317,36 +403,6 @@ async def monitor_process_tree(process_tree, duration, event_q: asyncio.Queue):
         await asyncio.sleep(0.85)
 
 
-async def init_db():
-    """Initialize db tables from script
-    TODO: Normalize 1st-stage::processes
-    """
-    async with aiosqlite.connect("events.db") as db:
-        try:
-            await db.executescript(schema_query)
-            await db.commit()
-            await db.close()
-        except aiosqlite.OperationalError as e:
-            print("[E] Error in appling database schema\n\t", e)
-            sys.exit(1)
-
-
-@asynccontextmanager
-async def db_session():
-    """
-    Generate db session and manage it's lifecycle
-    """
-    async with aiosqlite.connect("events.db") as db:
-        try:
-            yield db
-        except aiosqlite.OperationalError as e:
-            print("[E] Error in yielding database session:\n\t", e)
-            sys.exit(1)
-        finally:
-            await db.commit()
-            await db.close()
-
-
 async def match_pid_to_process(pid: int) -> Optional[psutil.Process]:
     """Match process pid to process name"""
     if not psutil.pid_exists(pid):
@@ -367,7 +423,7 @@ async def track_process(
     """  # noqa
 
     if not main_process:
-        print(f"No processes found for input")
+        print("No processes found for input")
         sys.exit(1)
 
     event_q = asyncio.Queue()
@@ -397,54 +453,6 @@ async def track_process(
     if display:
         print("[X] Displaying Sample Data [0:10]")
         await display_query(main_process, monitor_start_ts, monitor_end_ts)
-
-
-async def query_process(proc_name: str) -> None:
-    """Query collected porcesses from db"""
-    ts_from = input(">> Query from datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
-
-    ts_to = input(">> Query to datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
-
-    limit = input(">> Set results limit: ")
-    offset = input(">> Set results offset: ")
-
-    try:
-        datetime_to = datetime.strptime(ts_to, "%d/%m/%Y %H:%M:%S")
-        datetime_to = datetime_to - datetime_to.astimezone().tzinfo.utcoffset(datetime_to)
-        datetime_from = datetime.strptime(ts_from, "%d/%m/%Y %H:%M:%S")
-        datetime_from = datetime_from - datetime_from.astimezone().tzinfo.utcoffset(datetime_from)
-    except ValueError as e:
-        print("[E] Date format Error\n\t", e)
-        sys.exit(1)
-
-    try:
-        limit = int(limit)
-        offset = int(offset)
-    except ValueError:
-        print("[E] Could not parse limit/offset")
-        sys.exit(1)
-
-    async with db_session() as db:
-        num_rows = await db.execute(
-            count_query,
-            (proc_name, datetime_from, datetime_to),
-        )
-        print(f"[X] Total Rows: {(await num_rows.fetchone())[0]}")
-        print(f"From: {datetime_from}, To: {datetime_to}")
-
-        rows = await db.execute(
-            process_query,
-            (proc_name, datetime_from, datetime_to, limit, offset),
-        )
-        rows_result = await rows.fetchall()
-
-    print(
-        tabulate(
-            [row for row in rows_result],
-            ["CPU %", "Memory RSS (MB)", "Memory USS (MB)", "Charge Difference %"],
-            tablefmt="pretty",
-        )
-    )
 
 
 async def display_query(proc_name, ts_from, ts_to, limit=10, offset=0):
