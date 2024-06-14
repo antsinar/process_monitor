@@ -3,13 +3,14 @@ import asyncio
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import List, Optional
 
 import aiosqlite
 import matplotlib.pyplot as plt
+import polars
 import psutil
 from tabulate import tabulate
 
@@ -19,6 +20,7 @@ class Actions(StrEnum):
     QUERY = "query"
     MATCH_BUILD = "match_build"
     QUERY_BUILD = "query_build"
+    QUERY_SENSORS = "query_sensors"
 
 
 class BuildBase(StrEnum):
@@ -66,6 +68,15 @@ write_event_query = """
 
 process_query = """
     SELECT cpu_usage, memory_usage, uss, charge_diff
+    FROM events
+    WHERE proc_name = ?
+    AND ts BETWEEN ? AND ?
+    LIMIT ?
+    OFFSET ?
+"""
+
+sensors_query = """
+    SELECT cpu_usage, memory_usage, uss, ts
     FROM events
     WHERE proc_name = ?
     AND ts BETWEEN ? AND ?
@@ -223,6 +234,108 @@ async def query_process(proc_name: str) -> None:
             tablefmt="pretty",
         )
     )
+
+
+async def query_sensors(proc_name: str, logs_file: str) -> None:
+    """Query collected porcesses from db and combine with collected sensor data"""
+
+    try:
+        with open(logs_file, "r") as f:
+            if f.readline().startswith(","):
+                skip_num = 1
+            else:
+                skip_num = 0
+            f.seek(0)
+    except FileNotFoundError:
+        print("[E] Unable to read log file -- exiting demo")
+        sys.exit(1)
+
+    ts_from = input(">> Query from datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
+
+    ts_to = input(">> Query to datetime: \n>> Format -> (dd/mm/YYYY HH:MM:SS)\n>> ")
+
+    limit = input(">> Set results limit: ")
+    offset = input(">> Set results offset: ")
+
+    try:
+        datetime_to = datetime.strptime(ts_to, "%d/%m/%Y %H:%M:%S")
+        datetime_to_db = datetime_to - datetime_to.astimezone().tzinfo.utcoffset(
+            datetime_to
+        )
+        if not datetime_to.date() == datetime.now().date():
+            print("[E] Date to not equal to today -- exiting demo")
+            sys.exit(1)
+
+        datetime_from = datetime.strptime(ts_from, "%d/%m/%Y %H:%M:%S")
+        datetime_from_db = datetime_from - datetime_from.astimezone().tzinfo.utcoffset(
+            datetime_from
+        )
+        if not datetime_from.date() == datetime.now().date():
+            print("[E] Date from not equal to today -- exiting demo")
+            sys.exit(1)
+
+    except ValueError as e:
+        print("[E] Date format Error\n\t", e)
+        sys.exit(1)
+
+    try:
+        limit = int(limit)
+        offset = int(offset)
+    except ValueError:
+        print("[E] Could not parse limit/offset")
+        sys.exit(1)
+
+    sensors_df = (
+        polars.scan_csv(logs_file, skip_rows=skip_num, has_header=True)
+        .with_columns(
+            polars.col("Time").str.strptime(polars.Datetime, "%m/%d/%Y %H:%M:%S")
+        )
+        .select(["Time", "CPU Package"])
+        .filter(polars.col("Time") > polars.lit(datetime_from))
+        .filter(polars.col("Time") < polars.lit(datetime_to))
+        .collect()
+    )
+
+    async with db_session() as db:
+        num_rows = await db.execute(
+            count_query,
+            (proc_name, datetime_from_db, datetime_to_db),
+        )
+        print(f"[X] Total Rows: {(await num_rows.fetchone())[0]}")
+        print(f"From: {datetime_from}, To: {datetime_to}")
+
+        rows = await db.execute(
+            sensors_query,
+            (proc_name, datetime_from_db, datetime_to_db, limit, offset),
+        )
+        rows_result = await rows.fetchall()
+
+    query_df = polars.DataFrame(
+        rows_result,
+        schema=[
+            "CPU %",
+            "Memory RSS (MB)",
+            "Memory USS (MB)",
+            "ts",
+        ],
+    )
+
+    query_datetimes = query_df.select("ts").to_series().to_list()
+    query_datetimes_conv = [
+        datetime.strptime(dt.split(".")[0].strip(), "%Y-%m-%d %H:%M:%S")
+        + timedelta(seconds=datetime.now().astimezone().utcoffset().seconds)
+        for dt in query_datetimes
+    ]
+
+    # combine data and print
+    total_df = polars.concat(
+        [
+            sensors_df.filter(polars.col("Time").is_in(query_datetimes_conv)),
+            query_df,
+        ],
+        how="horizontal",
+    )
+    print(total_df)
 
 
 async def save_build_info(proc_name: str) -> None:
@@ -521,7 +634,9 @@ async def main() -> None:
         default=False,
         help="Specify if process passed is given by name or pid, as found on system's task manager.",  # noqa
     )
-    parser.add_argument("--action", type=Actions, default=Actions.COLLECT)
+    parser.add_argument(
+        "--action", type=Actions, choices=Actions, default=Actions.COLLECT
+    )
     args = parser.parse_args()
 
     if not args.process and args.action != Actions.QUERY_BUILD:
@@ -556,6 +671,16 @@ async def main() -> None:
         await save_build_info(offline_proc_name)
     elif args.action == Actions.QUERY_BUILD.value:
         await query_build(display_in_browser=False)
+    elif args.action == Actions.QUERY_SENSORS:
+        if not Path("./sensors.conf").exists():
+            print("[E] Missing sensors.conf file")
+            sys.exit(1)
+        print(
+            "\n[Note] This works only for current day logs -- demonstrative purposes only\n"  # noqa
+        )
+        logs_location = Path("./sensors.conf").read_text().splitlines()[0].split("=")[1]
+        logs_file = logs_location + f"-{datetime.now().date()}.csv"
+        await query_sensors(offline_proc_name, logs_file)
     else:
         print("[E] Action not available")
         sys.exit(1)
