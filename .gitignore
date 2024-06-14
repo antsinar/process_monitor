@@ -5,3 +5,4 @@ venv/*
 sql/*
 *.db
 *.sqlite3
+sensors.conf
